@@ -26,7 +26,7 @@ Sir Trading is a no-liquidation leveraged token protocol. Key concepts:
 - **No liquidation** — APE has a convex payoff with bounded downside. APE holders cannot be liquidated.
 - **Leverage formula:** `leverage = 1 + 2^tier`. Tiers range from -4 (1.0625x) to +2 (5x).
 - **MegaSIR has 12 decimals, not 18.** Use `parseUnits(amount, 12)`, not `parseEther`.
-- **Oracle** uses Kumbaya DEX (Uniswap V3 fork) TWAP pools (1-minute delta, 30-minute TWAP window).
+- **Oracle** uses a 30-minute TWAP from Kumbaya DEX (Uniswap V3 fork) pools.
 
 ## Chain Configuration
 
@@ -43,7 +43,7 @@ Sir Trading is a no-liquidation leveraged token protocol. Key concepts:
 | Vault | `0x8d694D1b369BdE5B274Ad643fEdD74f836E88543` |
 | MegaSIR Token | `0x9367A0c482703d8d9bda995B03f8E71056a72500` |
 | Oracle | `0x4edF071a7dEe52fBE663DF7873994725ba91Cdc7` |
-| SystemControl | `0x549618c8E4b74f9eB319e459698b2CaF53dA0453` |
+| SystemControl | `0x549618c8E4b74f9eB519e459698b2CaF53dA0453` |
 | Contributors | `0x686748764c5C7Aa06FEc784E60D14b650bF79129` |
 | Assistant | `0xB91AE2c8365FD45030abA84a4666C4dB074E53E7` |
 | Treasury | `0xf1Db8f4D2543c2C881a3dC90754CEDf549cD362d` |
@@ -666,7 +666,7 @@ Always pass as `{ debtToken: address, collateralToken: address, leverageTier: in
 ### 6. APE addresses are per-vault
 Get the APE ERC-20 address via `Assistant.getAddressAPE(vaultId)`. TEA uses the Vault contract address with the `vaultId` as the ERC-1155 `tokenId`.
 
-### 7. MegaETH mint has 6 parameters
+### 7. Vault `mint` has 6 parameters
 The Vault `mint` function includes `portionLockTime` (uint8, 0-255). This is optional for TEA — set to 0 for no lock, or higher values to reduce the TEA minting fee. Ignored for APE minting.
 
 ## Core Operations
@@ -964,7 +964,7 @@ const reserves = await publicClient.readContract({
 })
 // reserves.reserveApes — collateral owned by APE holders
 // reserves.reserveLPers — collateral owned by TEA (LP) holders
-// reserves.tickPriceX42 — oracle price in Q21.42 fixed-point
+// reserves.tickPriceX42 — log_{1.0001}(price) scaled by 2^42
 ```
 
 ### Read User Positions
@@ -1009,15 +1009,7 @@ const isLocked = lockEndTimestamp > BigInt(Math.floor(Date.now() / 1000))
 ```typescript
 const amount = parseUnits('100', 12) // 12 decimals!
 
-// 1. Approve SIR token to itself (staking vault is within the SIR contract)
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'approve',
-  args: [SIR, amount],
-})
-
-// 2. Stake
+// Stake (uses internal balance accounting, no approve needed)
 await walletClient.writeContract({
   address: SIR,
   abi: sirAbi,
@@ -1244,7 +1236,7 @@ contract SirReader {
 
 | Fee | Rate | Recipient |
 |-----|------|-----------|
-| APE mint/burn | Varies by leverage tier and `baseFee` (default 1000 bps). E.g. ~9% at 1.5x, ~17% at 2x — these are illustrative, not constants | LPers + Stakers (stakers get up to 50% depending on vault tax) |
+| APE mint/burn | Same fee applies independently on both mint and burn: `feeRate = (baseFee × 2^tier) / (10000 + baseFee × 2^tier)` with default `baseFee = 1000`. Per-operation examples: tier -2 (1.0625x) ~2.4%, tier 0 (2x) ~9.1%, tier 1 (3x) ~16.7%, tier 2 (5x) ~28.6%. `priceOfAPE` and `quoteBurn` already account for the burn fee. | LPers + Stakers (stakers get up to 50% depending on vault tax) |
 | TEA mint | Default ~4.9% (`lpFee` 515 bps). **Reducible to 0% with full lock** (max lock defaults to 90 days) | Protocol-Owned Liquidity |
 | TEA burn | 0% | — |
 | Staker dividends | Distributed via fee auctions (24h duration, 247h cooldown) | SIR stakers (in ETH) |
@@ -1257,8 +1249,10 @@ contract SirReader {
 - **MegaSIR has 12 decimals** — not 18. Always use `parseUnits(amount, 12)`.
 - **APE tokens have dynamic per-vault naming** — each vault deploys a separate APE clone. There is no single "MegaAPE" token.
 - **Optional TEA lock for fee reduction** — `portionLockTime` 0-255, where 0 = no lock (full fee), 255 = max lock (zero fee).
-- **Oracle** — backed by Kumbaya DEX pools with 1-minute delta and 30-minute TWAP window.
+- **Oracle** — 30-minute TWAP from Kumbaya DEX pools.
 - **Auction minimum bid increase:** 5% on MegaETH (vs 1% on Ethereum).
+- **Manipulation resistance:** Fees on both mint and burn plus a long 30-minute TWAP minimize price manipulation attacks.
+- **Saturation risk:** When creating vaults, if leverage is too high for the pair's volatility, the vault will frequently enter saturation — making it unappealing for both traders and LPs.
 
 ## Resources
 
