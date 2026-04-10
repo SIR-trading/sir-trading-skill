@@ -2,6 +2,10 @@
 
 AI coding skill for integrating [Sir Trading](https://app.sir.trading), a no-liquidation leveraged token protocol on MegaETH. Covers going long (minting APE), providing liquidity (minting TEA), closing/reducing positions (burning), quoting prices, creating new pairs (vaults), MegaSIR staking, claiming rewards, fee auctions, pair discovery, trading bots, and portfolio tracking.
 
+## Why SIR
+
+SIR is a new primitive for holding leverage long-term. Margin has liquidation and ongoing borrow fees. Leveraged tokens suffer volatility decay from rebalancing. Perps have liquidation and funding fees. Options have time decay and expiry. SIR eliminates all of these: no liquidation, no funding fees while holding, and best-effort mitigation of volatility decay. Fees are charged only on mint and burn. APE holders get a convex payoff (compounding gains up, bounded downside down). LPs (TEA holders) take the other side and collect trading fees, similar to Uniswap LPing.
+
 ## What This Skill Is For
 
 Use this skill when the user asks for:
@@ -20,12 +24,12 @@ Use this skill when the user asks for:
 
 ## Architecture
 
-Sir Trading is a no-liquidation leveraged token protocol. The app UI uses friendly terms — see the **Terminology** table below for the full mapping between app labels and contract terms. Key concepts:
+Sir Trading is a no-liquidation leveraged token protocol. The app UI uses friendly terms; see the **Terminology** table below for the full mapping between app labels and contract terms. Key concepts:
 
 - **Vaults (called "Pairs" in the app UI)** are identified by `VaultParameters { debtToken, collateralToken, leverageTier }`. A singleton Vault contract holds all vaults.
 - **APE** = ERC-20 leveraged token (going long). Each vault deploys a separate APE clone contract with dynamic per-vault naming (not a single "MegaAPE"). Get the address via `Assistant.getAddressAPE(vaultId)`.
-- **TEA** = ERC-1155 LP token (providing liquidity). The Vault contract itself is the TEA token — use the `vaultId` as the ERC-1155 `tokenId`.
-- **No liquidation** — APE has a convex payoff with bounded downside. APE holders cannot be liquidated.
+- **TEA** = ERC-1155 LP token (providing liquidity). The Vault contract itself is the TEA token. Use the `vaultId` as the ERC-1155 `tokenId`.
+- **No liquidation:** APE has a convex payoff with bounded downside. APE holders cannot be liquidated.
 - **Leverage formula:** `leverage = 1 + 2^tier`. Tiers range from -4 (1.0625x) to +2 (5x).
 - **MegaSIR has 12 decimals, not 18.** Use `parseUnits(amount, 12)`, not `parseEther`.
 - **Oracle** uses a 30-minute TWAP from Kumbaya DEX (Uniswap V3 fork) pools.
@@ -36,7 +40,7 @@ The app UI at [app.sir.trading](https://app.sir.trading) uses friendly labels. B
 
 | App UI Label | Contract Term | Description |
 |---|---|---|
-| **Pair** | Vault | A collateral/debt/leverage combination |
+| **Pair** | Vault | A leveraged token tracking collateral vs debt (base vs quote) at a specific constant leverage |
 | **Go Long** | Mint APE | Open a leveraged position |
 | **Close Position** / **Reduce Position** | Burn APE | Fully or partially exit a long |
 | **Provide Liquidity** | Mint TEA | Deposit collateral as an LP |
@@ -44,8 +48,8 @@ The app UI at [app.sir.trading](https://app.sir.trading) uses friendly labels. B
 | **New Pair** | Initialize vault | Create a new vault |
 | **Longs** | Active APE positions | Tab in Ledger & Leaderboard |
 | **LP** | Active TEA positions | Tab in Ledger & Leaderboard |
-| **Stake** / **Unstake** | stake / unstake | SIR token staking (same in UI and contract) |
-| **Claim SIR Rewards** | lperMint / claim | Claim SIR or ETH dividends |
+| **Stake** / **Unstake** | stake / unstake | MegaSIR token staking (same in UI and contract) |
+| **Claim MegaSIR Rewards** | lperMint / claim | Claim MegaSIR or ETH dividends |
 | **Ledger** | User positions page | Open longs, LP, staking, closed positions |
 | **The Exchange** | Leverage page | Page header for going long |
 | **The Tea Room** | Liquidity page | Page header for providing liquidity |
@@ -282,7 +286,7 @@ export const vaultAbi = [
     outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
   },
-  // Unclaimed SIR rewards for an LP
+  // Unclaimed MegaSIR rewards for an LP
   {
     type: "function",
     name: "unclaimedRewards",
@@ -309,7 +313,7 @@ export const vaultAbi = [
 
 ### MegaSIR / Staker ABI
 
-> **Note:** `bid()` is `payable` on MegaETH — send ETH as `msg.value`.
+> **Note:** `bid()` is `payable` on MegaETH; send ETH as `msg.value`.
 
 ```typescript
 export const sirAbi = [
@@ -582,7 +586,7 @@ export const assistantAbi = [
     ],
     stateMutability: "view",
   },
-  // Get user balances across vaults (APE, TEA, unclaimed SIR)
+  // Get user balances across vaults (APE, TEA, unclaimed MegaSIR)
   {
     type: "function",
     name: "getUserBalances",
@@ -672,25 +676,16 @@ export const assistantAbi = [
 ## Default Stack Decisions (Opinionated)
 
 ### 1. Assistant for quotes, Vault for execution
-The Assistant contract is read-only — use it for `quoteMint`, `quoteBurn`, `priceOfAPE`, `getUserBalances`, etc. The Vault contract executes state-changing operations (`mint`, `burn`, `initialize`).
+The Assistant contract is read-only. Use it for `quoteMint`, `quoteBurn`, `priceOfAPE`, `getUserBalances`, etc. The Vault contract executes state-changing operations (`mint`, `burn`, `initialize`).
 
-### 2. Use `eth_sendRawTransactionSync` for writes
-Instant receipts via EIP-7966. No polling needed — critical for trading bots on MegaETH.
-
-### 3. Always quote before minting
-Use `quoteMint` or `quoteMintWithDebtToken` before calling `vault.mint`. Quotes reflect current reserves, fees, and oracle prices.
-
-### 4. MegaSIR is 12 decimals
+### 2. MegaSIR is 12 decimals
 Use `parseUnits(amount, 12)`, not `parseEther`. The MegaSIR token uses 12 decimal places.
 
-### 5. VaultParameters is a struct tuple
+### 3. VaultParameters is a struct tuple
 Always pass as `{ debtToken: address, collateralToken: address, leverageTier: int8 }`. This struct identifies a unique vault.
 
-### 6. APE addresses are per-vault
+### 4. APE addresses are per-vault
 Get the APE ERC-20 address via `Assistant.getAddressAPE(vaultId)`. TEA uses the Vault contract address with the `vaultId` as the ERC-1155 `tokenId`.
-
-### 7. Vault `mint` has 6 parameters
-The Vault `mint` function includes `portionLockTime` (uint8, 0-255). This is optional for TEA — set to 0 for no lock, or higher values to reduce the TEA minting fee. Ignored for APE minting.
 
 ## Core Operations
 
@@ -821,7 +816,7 @@ const [amountCollateral, amountDebtToken] = await publicClient.readContract({
 
 ### Mint APE (Go Long) with Collateral Token
 
-The standard flow. Deposit collateral directly — no swap needed. Set `collateralToDepositMin` to `0n` since you're depositing collateral directly.
+The standard flow. Deposit collateral directly; no swap needed. Set `collateralToDepositMin` to `0n` since you're depositing collateral directly.
 
 ```typescript
 const erc20Abi = [
@@ -901,7 +896,7 @@ await walletClient.writeContract({
 
 ### Mint TEA (Provide Liquidity) with Collateral
 
-Same as APE but with `isAPE=false`. The optional `portionLockTime` (0-255) reduces the TEA minting fee — 0 means no lock (full fee), 255 means maximum lock (zero fee). The max lock duration defaults to 90 days.
+Same as APE but with `isAPE=false`. The optional `portionLockTime` (0-255) reduces the TEA minting fee: 0 means no lock (full fee), 255 means maximum lock (zero fee). The max lock duration defaults to 90 days.
 
 ```typescript
 // Approve collateral first (same as APE flow above)
@@ -916,7 +911,7 @@ await walletClient.writeContract({
 
 ### Mint TEA (Provide Liquidity) with Debt Token
 
-Same debt-token swap mechanism as APE minting — `collateralToDepositMin > 0` triggers the swap.
+Same debt-token swap mechanism as APE minting. `collateralToDepositMin > 0` triggers the swap.
 
 ```typescript
 await walletClient.writeContract({
@@ -992,7 +987,7 @@ const reserves = await publicClient.readContract({
 
 ### Read User Positions
 
-Batch-read APE balances, TEA balances, and unclaimed SIR rewards across all vaults.
+Batch-read APE balances, TEA balances, and unclaimed MegaSIR rewards across all vaults.
 
 ```typescript
 const numVaults = await publicClient.readContract({
@@ -1095,7 +1090,7 @@ await walletClient.writeContract({
 ### Claim LP Rewards
 
 ```typescript
-// Claim SIR rewards for providing TEA liquidity in a vault
+// Claim MegaSIR rewards for providing TEA liquidity in a vault
 await walletClient.writeContract({
   address: SIR,
   abi: sirAbi,
@@ -1262,25 +1257,25 @@ contract SirReader {
 | APE mint/burn | Same fee applies independently on both mint and burn: `feeRate = (baseFee × 2^tier) / (10000 + baseFee × 2^tier)` with default `baseFee = 1000`. Per-operation examples: tier -2 (1.0625x) ~2.4%, tier 0 (2x) ~9.1%, tier 1 (3x) ~16.7%, tier 2 (5x) ~28.6%. `priceOfAPE` and `quoteBurn` already account for the burn fee. | LPers + Stakers (stakers get up to 50% depending on vault tax) |
 | TEA mint | Default ~4.9% (`lpFee` 515 bps). **Reducible to 0% with full lock** (max lock defaults to 90 days) | Protocol-Owned Liquidity |
 | TEA burn | 0% | — |
-| Staker dividends | Distributed via fee auctions (24h duration, 247h cooldown) | SIR stakers (in ETH) |
+| Staker dividends | Distributed via fee auctions (24h duration, 247h cooldown) | MegaSIR stakers (in ETH) |
 
 ## MegaETH-Specific Notes
 
 - **Instant receipts:** Use `eth_sendRawTransactionSync` for sub-10ms confirmation via EIP-7966.
 - **No public mempool:** Transactions are sequencer-ordered. Front-running risk is structurally lower.
-- **Gas model:** SSTORE costs differ from Ethereum. First vault interactions are more expensive (new storage slots).
-- **MegaSIR has 12 decimals** — not 18. Always use `parseUnits(amount, 12)`.
-- **APE tokens have dynamic per-vault naming** — each vault deploys a separate APE clone. There is no single "MegaAPE" token.
-- **Optional TEA lock for fee reduction** — `portionLockTime` 0-255, where 0 = no lock (full fee), 255 = max lock (zero fee).
-- **Oracle** — 30-minute TWAP from Kumbaya DEX pools.
-- **Auction minimum bid increase:** 5% on MegaETH (vs 1% on Ethereum).
+- **Gas model:** SSTORE costs differ from L1. First vault interactions are more expensive (new storage slots).
+- **MegaSIR has 12 decimals**, not 18. Always use `parseUnits(amount, 12)`.
+- **APE tokens have dynamic per-vault naming:** each vault deploys a separate APE clone. There is no single "MegaAPE" token.
+- **Optional TEA lock for fee reduction:** `portionLockTime` 0-255, where 0 = no lock (full fee), 255 = max lock (zero fee).
+- **Oracle:** 30-minute TWAP from Kumbaya DEX pools.
+- **Auction minimum bid increase:** 5%.
 - **Manipulation resistance:** Fees on both mint and burn plus a long 30-minute TWAP minimize price manipulation attacks.
-- **Saturation risk:** When creating vaults, if leverage is too high for the pair's volatility, the vault will frequently enter saturation — making it unappealing for both traders and LPs.
+- **Saturation risk:** When creating vaults, if leverage is too high for the pair's volatility, the vault will frequently enter saturation, making it unappealing for both traders and LPs.
 
 ## Resources
 
-- [Sir Trading App](https://app.sir.trading) — Web interface
-- [Sir Trading Docs](https://docs.sir.trading) — Protocol documentation
-- [Core Contracts](https://github.com/SIR-trading/Core) — Vault, SIR/Staker, TEA, APE, Oracle
-- [Periphery Contracts](https://github.com/SIR-trading/Periphery) — Assistant, Quoter, Treasury
-- Kumbaya DEX skill — for swap integration and pool discovery
+- [Sir Trading App](https://app.sir.trading): Web interface
+- [Sir Trading Docs](https://docs.sir.trading): Protocol documentation
+- [Core Contracts](https://github.com/SIR-trading/Core): Vault, SIR/Staker, TEA, APE, Oracle
+- [Periphery Contracts](https://github.com/SIR-trading/Periphery): Assistant, Quoter, Treasury
+- Kumbaya DEX skill: for swap integration and pool discovery
