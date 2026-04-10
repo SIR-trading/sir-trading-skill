@@ -1,32 +1,55 @@
 # Sir Trading on MegaETH
 
-AI coding skill for integrating [Sir Trading](https://app.sir.trading), a no-liquidation leveraged token protocol on MegaETH. Covers APE/TEA minting and burning, quoting prices, creating new vaults, MegaSIR staking, claiming LP/contributor rewards, starting and bidding on fee auctions, vault discovery, trading bots, and portfolio tracking.
+AI coding skill for integrating [Sir Trading](https://app.sir.trading), a no-liquidation leveraged token protocol on MegaETH. Covers going long (minting APE), providing liquidity (minting TEA), closing/reducing positions (burning), quoting prices, creating new pairs (vaults), MegaSIR staking, claiming rewards, fee auctions, pair discovery, trading bots, and portfolio tracking.
 
 ## What This Skill Is For
 
 Use this skill when the user asks for:
-- Minting or burning APE (leveraged tokens)
-- Minting or burning TEA (LP tokens)
+- Going long / opening a leveraged position (minting APE)
+- Closing or reducing a position (burning APE)
+- Providing liquidity / LPing (minting TEA)
+- Withdrawing liquidity (burning TEA)
 - Quoting expected output before minting/burning
-- Creating new vaults
-- Discovering existing vaults and reading reserves
+- Creating new pairs (initializing vaults)
+- Discovering existing pairs (vaults) and reading reserves
 - Staking or unstaking MegaSIR
 - Claiming staking dividends or LP rewards
 - Starting or bidding on fee auctions
 - Building trading bots or portfolio trackers
-- Reading user positions and unclaimed rewards
+- Reading user positions (Ledger) and unclaimed rewards
 
 ## Architecture
 
-Sir Trading is a no-liquidation leveraged token protocol. Key concepts:
+Sir Trading is a no-liquidation leveraged token protocol. The app UI uses friendly terms — see the **Terminology** table below for the full mapping between app labels and contract terms. Key concepts:
 
-- **Vaults** are identified by `VaultParameters { debtToken, collateralToken, leverageTier }`. A singleton Vault contract holds all vaults.
-- **APE** = ERC-20 leveraged token. Each vault deploys a separate APE clone contract with dynamic per-vault naming (not a single "MegaAPE"). Get the address via `Assistant.getAddressAPE(vaultId)`.
-- **TEA** = ERC-1155 LP token. The Vault contract itself is the TEA token — use the `vaultId` as the ERC-1155 `tokenId`.
+- **Vaults (called "Pairs" in the app UI)** are identified by `VaultParameters { debtToken, collateralToken, leverageTier }`. A singleton Vault contract holds all vaults.
+- **APE** = ERC-20 leveraged token (going long). Each vault deploys a separate APE clone contract with dynamic per-vault naming (not a single "MegaAPE"). Get the address via `Assistant.getAddressAPE(vaultId)`.
+- **TEA** = ERC-1155 LP token (providing liquidity). The Vault contract itself is the TEA token — use the `vaultId` as the ERC-1155 `tokenId`.
 - **No liquidation** — APE has a convex payoff with bounded downside. APE holders cannot be liquidated.
 - **Leverage formula:** `leverage = 1 + 2^tier`. Tiers range from -4 (1.0625x) to +2 (5x).
 - **MegaSIR has 12 decimals, not 18.** Use `parseUnits(amount, 12)`, not `parseEther`.
 - **Oracle** uses a 30-minute TWAP from Kumbaya DEX (Uniswap V3 fork) pools.
+
+## Terminology
+
+The app UI at [app.sir.trading](https://app.sir.trading) uses friendly labels. Both the app terms and contract terms appear throughout this skill.
+
+| App UI Label | Contract Term | Description |
+|---|---|---|
+| **Pair** | Vault | A collateral/debt/leverage combination |
+| **Go Long** | Mint APE | Open a leveraged position |
+| **Close Position** / **Reduce Position** | Burn APE | Fully or partially exit a long |
+| **Provide Liquidity** | Mint TEA | Deposit collateral as an LP |
+| **Withdraw** / **Withdraw All** | Burn TEA | Exit an LP position |
+| **New Pair** | Initialize vault | Create a new vault |
+| **Longs** | Active APE positions | Tab in Ledger & Leaderboard |
+| **LP** | Active TEA positions | Tab in Ledger & Leaderboard |
+| **Stake** / **Unstake** | stake / unstake | SIR token staking (same in UI and contract) |
+| **Claim SIR Rewards** | lperMint / claim | Claim SIR or ETH dividends |
+| **Ledger** | User positions page | Open longs, LP, staking, closed positions |
+| **The Exchange** | Leverage page | Page header for going long |
+| **The Tea Room** | Liquidity page | Page header for providing liquidity |
+| **Auctions** | Fee auctions page | Bidding on accumulated fees |
 
 ## Chain Configuration
 
@@ -695,7 +718,7 @@ const account = privateKeyToAccount('0x...')
 const walletClient = createWalletClient({ account, chain: megaeth, transport: http() })
 ```
 
-### Discover Vaults
+### Discover Vaults (Pairs)
 
 ```typescript
 const numVaults = await publicClient.readContract({
@@ -728,7 +751,7 @@ const status = await publicClient.readContract({
 })
 ```
 
-### Create a New Vault
+### Create a New Vault (New Pair)
 
 A vault can be created if `getVaultStatus` returns `2` (VaultCanBeCreated). This requires a Kumbaya DEX pool to exist for the collateral/debt pair.
 
@@ -796,7 +819,7 @@ const [amountCollateral, amountDebtToken] = await publicClient.readContract({
 // amountDebtToken = equivalent in debt token (TWAP price)
 ```
 
-### Mint APE with Collateral Token
+### Mint APE (Go Long) with Collateral Token
 
 The standard flow. Deposit collateral directly — no swap needed. Set `collateralToDepositMin` to `0n` since you're depositing collateral directly.
 
@@ -830,7 +853,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Mint APE with Debt Token
+### Mint APE (Go Long) with Debt Token
 
 The vault automatically swaps the debt token to collateral via Kumbaya DEX. When `collateralToDepositMin > 0`, the contract knows `amountToDeposit` is in debt token and performs the swap. Use `quoteMintWithDebtToken` to get the expected collateral output for setting the minimum.
 
@@ -861,7 +884,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Mint APE with Native ETH
+### Mint APE (Go Long) with Native ETH
 
 If the vault uses WETH as collateral or debt token, send ETH as `msg.value` and the contract wraps it automatically.
 
@@ -876,7 +899,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Mint TEA (LP) with Collateral
+### Mint TEA (Provide Liquidity) with Collateral
 
 Same as APE but with `isAPE=false`. The optional `portionLockTime` (0-255) reduces the TEA minting fee — 0 means no lock (full fee), 255 means maximum lock (zero fee). The max lock duration defaults to 90 days.
 
@@ -891,7 +914,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Mint TEA with Debt Token
+### Mint TEA (Provide Liquidity) with Debt Token
 
 Same debt-token swap mechanism as APE minting — `collateralToDepositMin > 0` triggers the swap.
 
@@ -904,7 +927,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Mint TEA with Native ETH
+### Mint TEA (Provide Liquidity) with Native ETH
 
 ```typescript
 await walletClient.writeContract({
@@ -916,7 +939,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Burn APE
+### Burn APE (Close/Reduce Position)
 
 Returns collateral to the caller.
 
@@ -929,7 +952,7 @@ await walletClient.writeContract({
 })
 ```
 
-### Burn TEA
+### Burn TEA (Withdraw Liquidity)
 
 Returns collateral. TEA must not be locked (check `lockEnd` first).
 
@@ -1141,7 +1164,7 @@ await walletClient.writeContract({
 
 ## Foundry Integration (Solidity)
 
-### Mint APE from Collateral
+### Mint APE (Go Long) from Collateral
 
 ```solidity
 // SPDX-License-Identifier: MIT
