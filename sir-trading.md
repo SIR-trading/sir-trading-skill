@@ -1,1281 +1,618 @@
-# Sir Trading on MegaETH
+# SIR Trading
 
-AI coding skill for integrating [Sir Trading](https://app.sir.trading), a no-liquidation leveraged token protocol on MegaETH. Covers going long (minting APE), providing liquidity (minting TEA), closing/reducing positions (burning), quoting prices, creating new pairs (vaults), MegaSIR staking, claiming rewards, fee auctions, pair discovery, trading bots, and portfolio tracking.
+AI coding skill for integrating [SIR Trading](https://app.sir.trading), a no-liquidation leveraged-token protocol. The same contracts are deployed on **Ethereum, HyperEVM, and MegaETH**. This skill lets an agent go long (mint APE), provide liquidity (mint TEA), close/reduce positions (burn), quote prices, create pairs (vaults), stake SIR, claim rewards, run fee auctions, discover pairs, and track portfolios — on any of the three chains from one code path.
+
+> The protocol is identical on every chain. Almost everything in this skill is chain-agnostic; the only inputs that change per chain are **addresses, the DEX/oracle source, the native token, the SIR symbol, and whether TEA has a lock period**. Read [Chains](#chains) and [Per-Chain Notes](#per-chain-notes) and you can write one integration that works everywhere.
 
 ## Why SIR
 
-SIR is a new primitive for holding leverage long-term. Margin has liquidation and ongoing borrow fees. Leveraged tokens suffer volatility decay from rebalancing. Perps have liquidation and funding fees. Options have time decay and expiry. SIR eliminates all of these: no liquidation, no funding fees while holding, and best-effort mitigation of volatility decay. Fees are charged only on mint and burn. APE holders get a convex payoff (compounding gains up, bounded downside down). LPs (TEA holders) take the other side and collect trading fees, similar to Uniswap LPing.
+SIR is a primitive for holding leverage long-term. Margin has liquidation and ongoing borrow fees. Leveraged tokens suffer volatility decay from rebalancing. Perps have liquidation and funding. Options have time decay and expiry. SIR removes those: **no liquidation, no funding while holding, and best-effort mitigation of volatility decay.** Fees are charged only on mint and burn. APE holders get a convex payoff (compounding gains up, bounded loss down). LPs (TEA holders) take the other side and collect the mint fees, like Uniswap LPing.
 
-## What This Skill Is For
+## When to use this skill
 
-Use this skill when the user asks for:
-- Going long / opening a leveraged position (minting APE)
-- Closing or reducing a position (burning APE)
-- Providing liquidity / LPing (minting TEA)
-- Withdrawing liquidity (burning TEA)
-- Quoting expected output before minting/burning
-- Creating new pairs (initializing vaults)
-- Discovering existing pairs (vaults) and reading reserves
-- Staking or unstaking MegaSIR
-- Claiming staking dividends or LP rewards
-- Starting or bidding on fee auctions
-- Building trading bots or portfolio trackers
-- Reading user positions (Ledger) and unclaimed rewards
+- Go long / open a leveraged position → **mint APE**
+- Close or reduce a position → **burn APE**
+- Provide liquidity / LP → **mint TEA**; withdraw → **burn TEA**
+- Quote expected output before minting/burning
+- Discover existing pairs (vaults) and read reserves/metrics
+- Create a new pair (initialize a vault)
+- Stake / unstake SIR; claim staking dividends (paid in the chain's native token)
+- Claim LP rewards and contributor rewards (paid in SIR)
+- Start fee auctions, bid, claim auction lots
+- Build trading bots and portfolio trackers (read positions and unclaimed rewards)
 
 ## Architecture
 
-Sir Trading is a no-liquidation leveraged token protocol. The app UI uses friendly terms; see the **Terminology** table below for the full mapping between app labels and contract terms. Key concepts:
+- **Vault (called "Pair" in the app UI)** — a singleton contract holding every vault. A vault is identified by the struct `VaultParameters { address debtToken, address collateralToken, int8 leverageTier }`, and also by a sequential `vaultId` (`uint48`, starts at 1).
+- **APE** — the leveraged long token. **A separate ERC-20 contract per vault.** Get its address from the subgraph (`vault.ape.id`) or `Assistant.getAddressAPE(vaultId)`. Decimals are per-vault (`ape.decimals`).
+- **TEA** — the LP token. **A single ERC-1155 hosted by the Vault contract**, where the ERC-1155 `tokenId` **equals the `vaultId`**. TEA decimals **equal the collateral token's decimals** (not 18).
+- **No liquidation.** APE has a convex payoff with bounded downside; APE holders cannot be liquidated.
+- **Leverage** = `1 + 2^leverageTier`. Tiers run from `-4` (1.0625×) to `+2` (5×). Examples: tier `0` → 2×, `1` → 3×, `2` → 5×.
+- **SIR has 12 decimals**, not 18, on every chain. Use `parseUnits(amount, 12)`, never `parseEther`.
+- **Oracle** — a 30-minute TWAP from the chain's Uniswap-V3-style DEX (see [Chains](#chains)).
+- **Assistant** is a read-only periphery contract for quotes, batch reads, and address lookups. The **Vault** executes state changes (`mint`, `burn`, `initialize`). The **SIR** contract handles staking, reward claiming, and fee auctions.
 
-- **Vaults (called "Pairs" in the app UI)** are identified by `VaultParameters { debtToken, collateralToken, leverageTier }`. A singleton Vault contract holds all vaults.
-- **APE** = ERC-20 leveraged token (going long). Each vault deploys a separate APE clone contract with dynamic per-vault naming (not a single "MegaAPE"). Get the address via `Assistant.getAddressAPE(vaultId)`.
-- **TEA** = ERC-1155 LP token (providing liquidity). The Vault contract itself is the TEA token. Use the `vaultId` as the ERC-1155 `tokenId`.
-- **No liquidation:** APE has a convex payoff with bounded downside. APE holders cannot be liquidated.
-- **Leverage formula:** `leverage = 1 + 2^tier`. Tiers range from -4 (1.0625x) to +2 (5x).
-- **MegaSIR has 12 decimals, not 18.** Use `parseUnits(amount, 12)`, not `parseEther`.
-- **Oracle** uses a 30-minute TWAP from Kumbaya DEX (Uniswap V3 fork) pools.
+### Terminology (app UI label → contract term)
 
-## Terminology
-
-The app UI at [app.sir.trading](https://app.sir.trading) uses friendly labels. Both the app terms and contract terms appear throughout this skill.
-
-| App UI Label | Contract Term | Description |
+| App UI | Contract | Meaning |
 |---|---|---|
-| **Pair** | Vault | A leveraged token tracking collateral vs debt (base vs quote) at a specific constant leverage |
-| **Go Long** | Mint APE | Open a leveraged position |
-| **Close Position** / **Reduce Position** | Burn APE | Fully or partially exit a long |
-| **Provide Liquidity** | Mint TEA | Deposit collateral as an LP |
-| **Withdraw** / **Withdraw All** | Burn TEA | Exit an LP position |
-| **New Pair** | Initialize vault | Create a new vault |
-| **Longs** | Active APE positions | Tab in Ledger & Leaderboard |
-| **LP** | Active TEA positions | Tab in Ledger & Leaderboard |
-| **Stake** / **Unstake** | stake / unstake | MegaSIR token staking (same in UI and contract) |
-| **Claim MegaSIR Rewards** | lperMint / claim | Claim MegaSIR or ETH dividends |
-| **Ledger** | User positions page | Open longs, LP, staking, closed positions |
-| **The Exchange** | Leverage page | Page header for going long |
-| **The Tea Room** | Liquidity page | Page header for providing liquidity |
-| **Auctions** | Fee auctions page | Bidding on accumulated fees |
+| Pair | Vault | A leveraged token: collateral (base) vs debt (quote) at a fixed leverage |
+| Go Long | Mint APE | Open a leveraged position |
+| Close / Reduce | Burn APE | Exit a long, fully or partially |
+| Provide Liquidity | Mint TEA | Deposit collateral as an LP |
+| Withdraw | Burn TEA | Exit an LP position |
+| New Pair | `initialize` | Create a new vault |
+| Longs | APE positions | Ledger / Leaderboard tab |
+| LP | TEA positions | Ledger / Leaderboard tab |
+| Stake / Unstake | `stake` / `unstake` | SIR staking |
+| Claim Rewards | `lperMint` / `claim` | Claim SIR (LP) or native dividends (stakers) |
+| Ledger | User positions page | Open longs, LP, staking, closed positions |
+| The Exchange | Leverage page | Going long |
+| The Tea Room | Liquidity page | Providing liquidity |
+| Auctions | Fee auctions | Bidding on accumulated fees |
 
-## Chain Configuration
+## Live data sources (read these instead of hardcoding)
 
-| Network | Chain ID | RPC |
-|---------|----------|-----|
-| MegaETH Mainnet | 4326 | `https://mainnet.megaeth.com/rpc` |
+Addresses and system parameters are deployment state, not constants. Two canonical, always-fresh sources back the production app — prefer them over the static tables below:
 
-## Contract Addresses
+1. **`https://app.sir.trading/build-data.json`** — per chain: every contract address, the live system parameters (`baseFee`, `lpFee`, `lpLockTime`, `mintingStopped`, `cumulativeTax`), `timestampIssuanceStart`, and the `subgraphUrl`. This is generated at each deploy by resolving everything on-chain from the Assistant address.
 
-### Core Protocol (MegaETH 4326)
+2. **The subgraph** (URL per chain in `build-data.json`) — indexed vaults, positions, auctions, and metrics. The efficient path for discovery and portfolio reads; on-chain enumeration is the trustless fallback.
 
-| Contract | Address |
-|----------|---------|
-| Vault | `0x8d694D1b369BdE5B274Ad643fEdD74f836E88543` |
-| MegaSIR Token | `0x9367A0c482703d8d9bda995B03f8E71056a72500` |
-| Oracle | `0x4edF071a7dEe52fBE663DF7873994725ba91Cdc7` |
-| SystemControl | `0x549618c8E4b74f9eB519e459698b2CaF53dA0453` |
-| Contributors | `0x686748764c5C7Aa06FEc784E60D14b650bF79129` |
-| Assistant | `0xB91AE2c8365FD45030abA84a4666C4dB074E53E7` |
-| Treasury | `0xf1Db8f4D2543c2C881a3dC90754CEDf549cD362d` |
+Everything bootstraps from **one address per chain — the Assistant.** `Assistant.VAULT()` → `Vault.SIR()` / `.ORACLE()` → `SIR.CONTRIBUTORS()`. So if you only trust on-chain reads, you need just the Assistant address; derive the rest.
 
-### Kumbaya DEX Dependencies
+```ts
+// Always-fresh addresses + params, no redeploy drift
+const buildData = await fetch("https://app.sir.trading/build-data.json").then(r => r.json());
+const eth = buildData.chains["1"];
+// eth.contractAddresses.{vault,assistant,sir,oracle,systemControl,...}
+// eth.systemParams.{baseFee,lpFee,mintingStopped,cumulativeTax,lpLockTime?}
+// eth.subgraphUrl
+```
 
-| Contract | Address |
-|----------|---------|
-| UniswapV3Factory | `0x68b34591f662508076927803c567Cc8006988a09` |
-| SwapRouter | `0xE5BbEF8De2DB447a7432A47EBa58924d94eE470e` |
-| QuoterV2 | `0x1F1a8dC7E138C34b503Ca080962aC10B75384a27` |
-| WETH | `0x4200000000000000000000000000000000000006` |
+## Chains
+
+| | Ethereum | HyperEVM | MegaETH |
+|---|---|---|---|
+| Chain ID | `1` | `999` | `4326` |
+| Native token | ETH | **HYPE** | ETH |
+| Wrapped native | WETH `0xC02a…756Cc2` | **WHYPE `0x5555…5555`** | WETH `0x4200…0006` |
+| SIR symbol | **SIR** | **HyperSIR** | **MegaSIR** |
+| SIR decimals | 12 | 12 | 12 |
+| DEX / oracle source | Uniswap v3 | **HyperSwap** | **Kumbaya** |
+| TEA lock period | **none** | **none** | **optional, ≤90 days** (cuts mint fee) |
+| Auction min bid increment | **1%** | 5% | 5% |
+| Oracle TWAP window | 30 min | 30 min | 30 min |
+| Default stablecoin (quote) | USDT | USD₮0 | USDM |
+| Explorer | etherscan.io | hyperevmscan.io | mega.etherscan.io |
+
+`leverageTier`, decimals (SIR=12), the leverage formula, and every ABI are the same on all three. The behavioral forks are small but real: the **TEA lock period** (MegaETH only) and the **auction min bid increment** (1% on Ethereum vs 5% elsewhere). See [Per-Chain Notes](#per-chain-notes).
+
+### Contract addresses (snapshot — verify against `build-data.json`)
+
+| Contract | Ethereum (1) | HyperEVM (999) | MegaETH (4326) |
+|---|---|---|---|
+| Assistant | `0xff14f91285580AEd3733c0B1F3C8b6d04804c5ec` | `0x7d987b986FbA5e0A4247649A2334Bb2D4029656c` | `0xB91AE2c8365FD45030abA84a4666C4dB074E53E7` |
+| Vault | `0x7Dad75dD36dE234C937C105e652B6E50d68b0309` | `0x4a35e7448Dad9cAc6B3e529050B5a6Ee56A0eDF0` | `0x8d694D1b369BdE5B274Ad643fEdD74f836E88543` |
+| SIR | `0x4Da4fb565Dcd5D5C5dB495205c109bA983A8ABa2` | `0xA06D0c5a8ADb7134903CA13D1FC0641731E2B766` | `0x9367A0c482703d8d9bda995B03f8E71056a72500` |
+| Oracle | `0xeD89aF5E62965C45956A0125a5d078218228497A` | `0x2Ab530127a40a832B3e9AD2F0eC6Cdfee17542E0` | `0x4edF071a7dEe52fBE663DF7873994725ba91Cdc7` |
+| Wrapped native | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` | `0x5555555555555555555555555555555555555555` | `0x4200000000000000000000000000000000000006` |
+| DEX SwapRouter | `0xE592427A0AEce92De3Edee1F18E0157C05861564` | `0x6D99e7f6747AF2cDbB5164b6DD50e40D4fDe1e77` | `0xE5BbEF8De2DB447a7432A47EBa58924d94eE470e` |
+| DEX QuoterV2 | `0x61fFE014bA17989E743c5F6cB21bF9697530B21e` | `0x03A918028f22D9E1473B7959C927AD7425A45C7C` | `0x1F1a8dC7E138C34b503Ca080962aC10B75384a27` |
+| DEX Factory | `0x1F98431c8aD98523631AE4a59f267346ea31F984` | `0xB1c0fa0B789320044A6F623cFe5eBda9562602E3` | `0x68b34591f662508076927803c567Cc8006988a09` |
+
+### System parameters (snapshot — read live from `build-data.json`)
+
+Identical across chains today, but governance-settable and read live; never hardcode for fee math:
+
+| Param | Value | Meaning |
+|---|---|---|
+| `baseFee` | `1000` (= `0.1` in build-data) | APE fee coefficient (see [Fees](#fee-structure)) |
+| `lpFee` | `515` bps (= `0.0515`) | TEA mint fee coefficient |
+| `lpLockTime` | `7776000`s (90d) **MegaETH only** | TEA max lock duration; absent ⇒ no lock |
+| `mintingStopped` | `false` | If `true`, minting is disabled protocol-wide — check before minting |
+| `cumulativeTax` | 493 / 347 / 543 | Vault tax; sets the staker share of fees |
 
 ## ABIs
+
+Minimal ABIs covering everything in this skill. Full ABIs live in the [Core](https://github.com/SIR-trading/Core) and [Periphery](https://github.com/SIR-trading/Periphery) repos.
 
 ### Vault ABI
 
 ```typescript
 export const vaultAbi = [
-  // Mint APE or TEA
-  {
-    type: "function",
-    name: "mint",
+  // --- state-changing ---
+  { type: "function", name: "mint", stateMutability: "payable",
     inputs: [
       { name: "isAPE", type: "bool" },
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-      { name: "amountToDeposit", type: "uint256" },
-      { name: "collateralToDepositMin", type: "uint144" },
-      { name: "deadline", type: "uint40" },
-      { name: "portionLockTime", type: "uint8" },
-    ],
-    outputs: [{ name: "amount", type: "uint256" }],
-    stateMutability: "payable",
-  },
-  // Burn APE or TEA
-  {
-    type: "function",
-    name: "burn",
+      { name: "vaultParams", type: "tuple", components: [
+        { name: "debtToken", type: "address" },
+        { name: "collateralToken", type: "address" },
+        { name: "leverageTier", type: "int8" }] },
+      { name: "amountToDeposit", type: "uint256" },       // collateral if min==0, else debt token
+      { name: "collateralToDepositMin", type: "uint144" },// > 0 signals a debt-token deposit (swap)
+      { name: "deadline", type: "uint40" },               // unix secs; 0 = no deadline
+      { name: "portionLockTime", type: "uint8" }],        // TEA only; 0 = full fee, 255 = zero fee (MegaETH)
+    outputs: [{ name: "amount", type: "uint256" }] },
+  { type: "function", name: "burn", stateMutability: "nonpayable",
     inputs: [
       { name: "isAPE", type: "bool" },
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
+      { name: "vaultParams", type: "tuple", components: [
+        { name: "debtToken", type: "address" },
+        { name: "collateralToken", type: "address" },
+        { name: "leverageTier", type: "int8" }] },
       { name: "amount", type: "uint256" },
-      { name: "deadline", type: "uint40" },
-    ],
-    outputs: [{ name: "", type: "uint144" }],
-    stateMutability: "nonpayable",
-  },
-  // Initialize a new vault
-  {
-    type: "function",
-    name: "initialize",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  // Get reserves for a vault
-  {
-    type: "function",
-    name: "getReserves",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [
-      {
-        name: "",
-        type: "tuple",
-        components: [
-          { name: "reserveApes", type: "uint144" },
-          { name: "reserveLPers", type: "uint144" },
-          { name: "tickPriceX42", type: "int64" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-  // Get vault state
-  {
-    type: "function",
-    name: "vaultStates",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [
-      {
-        name: "",
-        type: "tuple",
-        components: [
-          { name: "reserve", type: "uint144" },
-          { name: "tickPriceSatX42", type: "int64" },
-          { name: "vaultId", type: "uint48" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-  // Get vault parameters by ID
-  {
-    type: "function",
-    name: "paramsById",
+      { name: "deadline", type: "uint40" }],
+    outputs: [{ name: "", type: "uint144" }] },
+  { type: "function", name: "initialize", stateMutability: "nonpayable",
+    inputs: [{ name: "vaultParams", type: "tuple", components: [
+      { name: "debtToken", type: "address" },
+      { name: "collateralToken", type: "address" },
+      { name: "leverageTier", type: "int8" }] }],
+    outputs: [] },
+  // --- views ---
+  { type: "function", name: "getReserves", stateMutability: "view",
+    inputs: [{ name: "vaultParams", type: "tuple", components: [
+      { name: "debtToken", type: "address" },
+      { name: "collateralToken", type: "address" },
+      { name: "leverageTier", type: "int8" }] }],
+    outputs: [{ name: "", type: "tuple", components: [
+      { name: "reserveApes", type: "uint144" },
+      { name: "reserveLPers", type: "uint144" },
+      { name: "tickPriceX42", type: "int64" }] }] },
+  { type: "function", name: "vaultStates", stateMutability: "view",
+    inputs: [{ name: "vaultParams", type: "tuple", components: [
+      { name: "debtToken", type: "address" },
+      { name: "collateralToken", type: "address" },
+      { name: "leverageTier", type: "int8" }] }],
+    outputs: [{ name: "", type: "tuple", components: [
+      { name: "reserve", type: "uint144" },
+      { name: "tickPriceSatX42", type: "int64" },
+      { name: "vaultId", type: "uint48" }] }] },
+  { type: "function", name: "paramsById", stateMutability: "view",
     inputs: [{ name: "vaultId", type: "uint48" }],
-    outputs: [
-      {
-        name: "",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-  // Total number of vaults
-  {
-    type: "function",
-    name: "numberOfVaults",
-    inputs: [],
-    outputs: [{ name: "", type: "uint48" }],
-    stateMutability: "view",
-  },
-  // Total reserves for a collateral token
-  {
-    type: "function",
-    name: "totalReserves",
-    inputs: [{ name: "collateral", type: "address" }],
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-  },
-  // TEA balance (ERC-1155)
-  {
-    type: "function",
-    name: "balanceOf",
-    inputs: [
-      { name: "account", type: "address" },
-      { name: "vaultId", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-  },
-  // TEA transfer (ERC-1155)
-  {
-    type: "function",
-    name: "safeTransferFrom",
-    inputs: [
-      { name: "from", type: "address" },
-      { name: "to", type: "address" },
-      { name: "vaultId", type: "uint256" },
-      { name: "amount", type: "uint256" },
-      { name: "data", type: "bytes" },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  // TEA approval (ERC-1155)
-  {
-    type: "function",
-    name: "setApprovalForAll",
-    inputs: [
-      { name: "operator", type: "address" },
-      { name: "approved", type: "bool" },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  // TEA total supply per vault
-  {
-    type: "function",
-    name: "totalSupply",
-    inputs: [{ name: "vaultId", type: "uint256" }],
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-  },
-  // Unclaimed MegaSIR rewards for an LP
-  {
-    type: "function",
-    name: "unclaimedRewards",
-    inputs: [
-      { name: "vaultId", type: "uint256" },
-      { name: "lper", type: "address" },
-    ],
-    outputs: [{ name: "", type: "uint80" }],
-    stateMutability: "view",
-  },
-  // TEA lock end timestamp
-  {
-    type: "function",
-    name: "lockEnd",
-    inputs: [
-      { name: "account", type: "address" },
-      { name: "vaultId", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "uint40" }],
-    stateMutability: "view",
-  },
+    outputs: [{ name: "", type: "tuple", components: [
+      { name: "debtToken", type: "address" },
+      { name: "collateralToken", type: "address" },
+      { name: "leverageTier", type: "int8" }] }] },
+  { type: "function", name: "numberOfVaults", stateMutability: "view", inputs: [],
+    outputs: [{ name: "", type: "uint48" }] },
+  // --- TEA (ERC-1155 on the Vault; tokenId == vaultId) ---
+  { type: "function", name: "balanceOf", stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }, { name: "vaultId", type: "uint256" }],
+    outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "totalSupply", stateMutability: "view",
+    inputs: [{ name: "vaultId", type: "uint256" }], outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "safeTransferFrom", stateMutability: "nonpayable",
+    inputs: [{ name: "from", type: "address" }, { name: "to", type: "address" },
+      { name: "vaultId", type: "uint256" }, { name: "amount", type: "uint256" }, { name: "data", type: "bytes" }],
+    outputs: [] },
+  { type: "function", name: "setApprovalForAll", stateMutability: "nonpayable",
+    inputs: [{ name: "operator", type: "address" }, { name: "approved", type: "bool" }], outputs: [] },
+  { type: "function", name: "unclaimedRewards", stateMutability: "view",
+    inputs: [{ name: "vaultId", type: "uint256" }, { name: "lper", type: "address" }],
+    outputs: [{ name: "", type: "uint80" }] },
+  { type: "function", name: "lockEnd", stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }, { name: "vaultId", type: "uint256" }],
+    outputs: [{ name: "", type: "uint40" }] },
 ] as const;
 ```
 
-### MegaSIR / Staker ABI
-
-> **Note:** `bid()` is `payable` on MegaETH; send ETH as `msg.value`.
+### SIR ABI (token + staking + rewards + auctions)
 
 ```typescript
 export const sirAbi = [
-  // Staking
-  {
-    type: "function",
-    name: "stake",
-    inputs: [{ name: "amount", type: "uint80" }],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "unstake",
-    inputs: [{ name: "amount", type: "uint80" }],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "claim",
-    inputs: [],
-    outputs: [{ name: "dividends_", type: "uint96" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "unstakeAndClaim",
-    inputs: [{ name: "amount", type: "uint80" }],
-    outputs: [{ name: "dividends_", type: "uint96" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "stakeOf",
+  // --- staking ---
+  { type: "function", name: "stake", stateMutability: "nonpayable",
+    inputs: [{ name: "amount", type: "uint80" }], outputs: [] },
+  { type: "function", name: "unstake", stateMutability: "nonpayable",
+    inputs: [{ name: "amount", type: "uint80" }], outputs: [] },
+  { type: "function", name: "claim", stateMutability: "nonpayable",
+    inputs: [], outputs: [{ name: "dividends_", type: "uint96" }] },
+  { type: "function", name: "unstakeAndClaim", stateMutability: "nonpayable",
+    inputs: [{ name: "amount", type: "uint80" }], outputs: [{ name: "dividends_", type: "uint96" }] },
+  { type: "function", name: "stakeOf", stateMutability: "view",
     inputs: [{ name: "staker", type: "address" }],
-    outputs: [
-      { name: "unlockedStake", type: "uint80" },
-      { name: "lockedStake", type: "uint80" },
-    ],
-    stateMutability: "view",
-  },
-  {
-    type: "function",
-    name: "unclaimedDividends",
-    inputs: [{ name: "staker", type: "address" }],
-    outputs: [{ name: "", type: "uint96" }],
-    stateMutability: "view",
-  },
-  // LP reward claiming
-  {
-    type: "function",
-    name: "lperMint",
-    inputs: [{ name: "vaultId", type: "uint256" }],
-    outputs: [{ name: "rewards", type: "uint80" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "lperMintAndStake",
-    inputs: [{ name: "vaultId", type: "uint256" }],
-    outputs: [{ name: "rewards", type: "uint80" }],
-    stateMutability: "nonpayable",
-  },
-  // Contributor reward claiming
-  {
-    type: "function",
-    name: "contributorMint",
-    inputs: [],
-    outputs: [{ name: "rewards", type: "uint80" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "contributorMintAndStake",
-    inputs: [],
-    outputs: [{ name: "rewards", type: "uint80" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "contributorUnclaimedSIR",
-    inputs: [{ name: "contributor", type: "address" }],
-    outputs: [{ name: "", type: "uint80" }],
-    stateMutability: "view",
-  },
-  // Fee auctions
-  {
-    type: "function",
-    name: "collectFeesAndStartAuction",
+    outputs: [{ name: "unlockedStake", type: "uint80" }, { name: "lockedStake", type: "uint80" }] },
+  { type: "function", name: "unclaimedDividends", stateMutability: "view",
+    inputs: [{ name: "staker", type: "address" }], outputs: [{ name: "", type: "uint96" }] },
+  // --- reward claiming (mints SIR) ---
+  { type: "function", name: "lperMint", stateMutability: "nonpayable",
+    inputs: [{ name: "vaultId", type: "uint256" }], outputs: [{ name: "rewards", type: "uint80" }] },
+  { type: "function", name: "lperMintAndStake", stateMutability: "nonpayable",
+    inputs: [{ name: "vaultId", type: "uint256" }], outputs: [{ name: "rewards", type: "uint80" }] },
+  { type: "function", name: "contributorMint", stateMutability: "nonpayable",
+    inputs: [], outputs: [{ name: "rewards", type: "uint80" }] },
+  { type: "function", name: "contributorMintAndStake", stateMutability: "nonpayable",
+    inputs: [], outputs: [{ name: "rewards", type: "uint80" }] },
+  { type: "function", name: "contributorUnclaimedSIR", stateMutability: "view",
+    inputs: [{ name: "contributor", type: "address" }], outputs: [{ name: "", type: "uint80" }] },
+  // --- fee auctions ---
+  { type: "function", name: "collectFeesAndStartAuction", stateMutability: "nonpayable",
+    inputs: [{ name: "token", type: "address" }], outputs: [{ name: "totalFees", type: "uint256" }] },
+  { type: "function", name: "bid", stateMutability: "payable",
+    inputs: [{ name: "token", type: "address" }, { name: "amount", type: "uint96" }], outputs: [] },
+  { type: "function", name: "getAuctionLot", stateMutability: "nonpayable",
+    inputs: [{ name: "token", type: "address" }, { name: "beneficiary", type: "address" }], outputs: [] },
+  { type: "function", name: "auctions", stateMutability: "view",
     inputs: [{ name: "token", type: "address" }],
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "bid",
-    inputs: [
-      { name: "token", type: "address" },
-      { name: "amount", type: "uint96" },
-    ],
-    outputs: [],
-    stateMutability: "payable",
-  },
-  {
-    type: "function",
-    name: "getAuctionLot",
-    inputs: [
-      { name: "token", type: "address" },
-      { name: "beneficiary", type: "address" },
-    ],
-    outputs: [],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "auctions",
-    inputs: [{ name: "token", type: "address" }],
-    outputs: [
-      { name: "bidder", type: "address" },
-      { name: "bid", type: "uint96" },
-      { name: "startTime", type: "uint40" },
-    ],
-    stateMutability: "view",
-  },
-  // ERC-20
-  {
-    type: "function",
-    name: "balanceOf",
-    inputs: [{ name: "account", type: "address" }],
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-  },
-  {
-    type: "function",
-    name: "approve",
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "transfer",
-    inputs: [
-      { name: "to", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "decimals",
-    inputs: [],
-    outputs: [{ name: "", type: "uint8" }],
-    stateMutability: "view",
-  },
-  // Multicall
-  {
-    type: "function",
-    name: "multicall",
-    inputs: [{ name: "data", type: "bytes[]" }],
-    outputs: [{ name: "results", type: "bytes[]" }],
-    stateMutability: "nonpayable",
-  },
+    outputs: [{ name: "", type: "tuple", components: [
+      { name: "bidder", type: "address" }, { name: "bid", type: "uint96" }, { name: "startTime", type: "uint40" }] }] },
+  // --- ERC-20 (12 decimals) ---
+  { type: "function", name: "balanceOf", stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "approve", stateMutability: "nonpayable",
+    inputs: [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }],
+    outputs: [{ name: "", type: "bool" }] },
+  { type: "function", name: "transfer", stateMutability: "nonpayable",
+    inputs: [{ name: "to", type: "address" }, { name: "amount", type: "uint256" }],
+    outputs: [{ name: "", type: "bool" }] },
+  { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
 ] as const;
 ```
 
-### Assistant ABI
+### Assistant ABI (quotes + batch reads)
 
 ```typescript
 export const assistantAbi = [
-  // Quote minting with collateral token
-  {
-    type: "function",
-    name: "quoteMint",
-    inputs: [
-      { name: "isAPE", type: "bool" },
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-      { name: "amountCollateral", type: "uint144" },
-    ],
-    outputs: [{ name: "amountTokens", type: "uint256" }],
-    stateMutability: "view",
-  },
-  // Quote minting with debt token (includes Kumbaya swap quote)
-  {
-    type: "function",
-    name: "quoteMintWithDebtToken",
-    inputs: [
-      { name: "isAPE", type: "bool" },
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-      { name: "amountDebtToken", type: "uint256" },
-    ],
-    outputs: [
-      { name: "amountTokens", type: "uint256" },
-      { name: "amountCollateral", type: "uint256" },
-      { name: "amountCollateralIdeal", type: "uint256" },
-    ],
-    stateMutability: "view",
-  },
-  // Quote burning APE or TEA
-  {
-    type: "function",
-    name: "quoteBurn",
-    inputs: [
-      { name: "isAPE", type: "bool" },
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-      { name: "amountTokens", type: "uint256" },
-    ],
-    outputs: [
-      { name: "amountCollateral", type: "uint144" },
-      { name: "amountDebtToken", type: "uint256" },
-    ],
-    stateMutability: "view",
-  },
-  // Convert collateral amount to debt token equivalent
-  {
-    type: "function",
-    name: "quoteCollateralToDebtToken",
-    inputs: [
-      { name: "debtToken", type: "address" },
-      { name: "collateralToken", type: "address" },
-      { name: "amountCollateral", type: "uint256" },
-    ],
-    outputs: [{ name: "amountDebtToken", type: "uint256" }],
-    stateMutability: "view",
-  },
-  // Get reserves for multiple vaults by ID
-  {
-    type: "function",
-    name: "getReserves",
+  { type: "function", name: "quoteMint", stateMutability: "view",
+    inputs: [{ name: "isAPE", type: "bool" },
+      { name: "vaultParams", type: "tuple", components: [
+        { name: "debtToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "leverageTier", type: "int8" }] },
+      { name: "amountCollateral", type: "uint144" }],
+    outputs: [{ name: "amountTokens", type: "uint256" }] },
+  { type: "function", name: "quoteMintWithDebtToken", stateMutability: "view",
+    inputs: [{ name: "isAPE", type: "bool" },
+      { name: "vaultParams", type: "tuple", components: [
+        { name: "debtToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "leverageTier", type: "int8" }] },
+      { name: "amountDebtToken", type: "uint256" }],
+    outputs: [{ name: "amountTokens", type: "uint256" }, { name: "amountCollateral", type: "uint256" }, { name: "amountCollateralIdeal", type: "uint256" }] },
+  { type: "function", name: "quoteBurn", stateMutability: "view",
+    inputs: [{ name: "isAPE", type: "bool" },
+      { name: "vaultParams", type: "tuple", components: [
+        { name: "debtToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "leverageTier", type: "int8" }] },
+      { name: "amountTokens", type: "uint256" }],
+    outputs: [{ name: "amountCollateral", type: "uint144" }, { name: "amountDebtToken", type: "uint256" }] },
+  { type: "function", name: "getReserves", stateMutability: "view",
     inputs: [{ name: "vaultIds", type: "uint48[]" }],
-    outputs: [
-      {
-        name: "reserves",
-        type: "tuple[]",
-        components: [
-          { name: "reserveApes", type: "uint144" },
-          { name: "reserveLPers", type: "uint144" },
-          { name: "tickPriceX42", type: "int64" },
-        ],
-      },
-    ],
-    stateMutability: "view",
-  },
-  // Get user balances across vaults (APE, TEA, unclaimed MegaSIR)
-  {
-    type: "function",
-    name: "getUserBalances",
-    inputs: [
-      { name: "user", type: "address" },
-      { name: "offset", type: "uint256" },
-      { name: "numVaults", type: "uint256" },
-    ],
-    outputs: [
-      { name: "apeBalances", type: "uint256[]" },
-      { name: "teaBalances", type: "uint256[]" },
-      { name: "unclaimedSirRewards", type: "uint80[]" },
-    ],
-    stateMutability: "view",
-  },
-  // Price of TEA in collateral (num/den)
-  {
-    type: "function",
-    name: "priceOfTEA",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [
-      { name: "num", type: "uint256" },
-      { name: "den", type: "uint256" },
-    ],
-    stateMutability: "view",
-  },
-  // Price of APE in collateral (num/den)
-  {
-    type: "function",
-    name: "priceOfAPE",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [
-      { name: "num", type: "uint256" },
-      { name: "den", type: "uint256" },
-    ],
-    stateMutability: "view",
-  },
-  // Check vault status (InvalidVault, NoUniswapPool, VaultCanBeCreated, VaultAlreadyExists)
-  {
-    type: "function",
-    name: "getVaultStatus",
-    inputs: [
-      {
-        name: "vaultParams",
-        type: "tuple",
-        components: [
-          { name: "debtToken", type: "address" },
-          { name: "collateralToken", type: "address" },
-          { name: "leverageTier", type: "int8" },
-        ],
-      },
-    ],
-    outputs: [{ name: "", type: "uint8" }],
-    stateMutability: "view",
-  },
-  // Get the APE token address for a vault
-  {
-    type: "function",
-    name: "getAddressAPE",
-    inputs: [{ name: "vaultId", type: "uint48" }],
-    outputs: [{ name: "", type: "address" }],
-    stateMutability: "view",
-  },
+    outputs: [{ name: "reserves", type: "tuple[]", components: [
+      { name: "reserveApes", type: "uint144" }, { name: "reserveLPers", type: "uint144" }, { name: "tickPriceX42", type: "int64" }] }] },
+  { type: "function", name: "getUserBalances", stateMutability: "view",
+    inputs: [{ name: "user", type: "address" }, { name: "offset", type: "uint256" }, { name: "numVaults", type: "uint256" }],
+    outputs: [{ name: "apeBalances", type: "uint256[]" }, { name: "teaBalances", type: "uint256[]" }, { name: "unclaimedSirRewards", type: "uint80[]" }] },
+  { type: "function", name: "getVaultStatus", stateMutability: "view",
+    inputs: [{ name: "vaultParams", type: "tuple", components: [
+      { name: "debtToken", type: "address" }, { name: "collateralToken", type: "address" }, { name: "leverageTier", type: "int8" }] }],
+    outputs: [{ name: "", type: "uint8" }] },  // 0=Invalid 1=NoPool 2=CanBeCreated 3=AlreadyExists
+  { type: "function", name: "getAddressAPE", stateMutability: "view",
+    inputs: [{ name: "vaultId", type: "uint48" }], outputs: [{ name: "", type: "address" }] },
 ] as const;
 ```
 
-## Default Stack Decisions (Opinionated)
-
-### 1. Assistant for quotes, Vault for execution
-The Assistant contract is read-only. Use it for `quoteMint`, `quoteBurn`, `priceOfAPE`, `getUserBalances`, etc. The Vault contract executes state-changing operations (`mint`, `burn`, `initialize`).
-
-### 2. MegaSIR is 12 decimals
-Use `parseUnits(amount, 12)`, not `parseEther`. The MegaSIR token uses 12 decimal places.
-
-### 3. VaultParameters is a struct tuple
-Always pass as `{ debtToken: address, collateralToken: address, leverageTier: int8 }`. This struct identifies a unique vault.
-
-### 4. APE addresses are per-vault
-Get the APE ERC-20 address via `Assistant.getAddressAPE(vaultId)`. TEA uses the Vault contract address with the `vaultId` as the ERC-1155 `tokenId`.
-
-## Core Operations
-
-### Client Setup
+## Setup (one config, any chain)
 
 ```typescript
-import { createPublicClient, createWalletClient, http, defineChain, parseEther, parseUnits } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
-import { vaultAbi, sirAbi, assistantAbi } from './abis'
+import { createPublicClient, createWalletClient, http, defineChain, parseUnits } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { mainnet } from "viem/chains";
+import { vaultAbi, sirAbi, assistantAbi } from "./abis";
 
-const megaeth = defineChain({
-  id: 4326,
-  name: 'MegaETH',
-  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
-  rpcUrls: { default: { http: ['https://mainnet.megaeth.com/rpc'] } },
-})
-
-const VAULT = '0x8d694D1b369BdE5B274Ad643fEdD74f836E88543'
-const SIR = '0x9367A0c482703d8d9bda995B03f8E71056a72500'
-const ASSISTANT = '0xB91AE2c8365FD45030abA84a4666C4dB074E53E7'
-const WETH = '0x4200000000000000000000000000000000000006'
-
-const publicClient = createPublicClient({ chain: megaeth, transport: http() })
-const account = privateKeyToAccount('0x...')
-const walletClient = createWalletClient({ account, chain: megaeth, transport: http() })
-```
-
-### Discover Vaults (Pairs)
-
-```typescript
-const numVaults = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'numberOfVaults',
-})
-
-// Iterate all vaults
-for (let i = 1; i <= numVaults; i++) {
-  const params = await publicClient.readContract({
-    address: VAULT,
-    abi: vaultAbi,
-    functionName: 'paramsById',
-    args: [i],
-  })
-  console.log(`Vault ${i}:`, params.debtToken, params.collateralToken, params.leverageTier)
-}
-```
-
-### Check Vault Status
-
-```typescript
-// VaultStatus enum: 0=InvalidVault, 1=NoUniswapPool, 2=VaultCanBeCreated, 3=VaultAlreadyExists
-const status = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'getVaultStatus',
-  args: [{ debtToken: WETH, collateralToken: SOME_TOKEN, leverageTier: 1 }],
-})
-```
-
-### Create a New Vault (New Pair)
-
-A vault can be created if `getVaultStatus` returns `2` (VaultCanBeCreated). This requires a Kumbaya DEX pool to exist for the collateral/debt pair.
-
-```typescript
-const vaultParams = { debtToken: WETH, collateralToken: SOME_TOKEN, leverageTier: 1 }
-
-// 1. Check status
-const status = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'getVaultStatus',
-  args: [vaultParams],
-})
-if (status !== 2) throw new Error('Vault cannot be created (status: ' + status + ')')
-
-// 2. Initialize
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'initialize',
-  args: [vaultParams],
-})
-```
-
-### Quote Mint APE
-
-```typescript
-const vaultParams = { debtToken: WETH, collateralToken: SOME_TOKEN, leverageTier: 1 }
-const collateralAmount = parseUnits('100', 18) // adjust decimals to collateral token
-
-const expectedAPE = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'quoteMint',
-  args: [true, vaultParams, collateralAmount],
-})
-```
-
-### Quote Mint with Debt Token
-
-Quotes the swap from debt token to collateral via Kumbaya DEX, then quotes the resulting APE/TEA amount.
-
-```typescript
-const [amountTokens, amountCollateral, amountCollateralIdeal] = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'quoteMintWithDebtToken',
-  args: [true, vaultParams, parseEther('1')], // 1 WETH as debt token
-})
-// amountTokens = expected APE/TEA output
-// amountCollateral = collateral after swap (with slippage)
-// amountCollateralIdeal = collateral at spot price (no slippage)
-```
-
-### Quote Burn
-
-```typescript
-const [amountCollateral, amountDebtToken] = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'quoteBurn',
-  args: [true, vaultParams, apeAmount], // isAPE=true for APE, false for TEA
-})
-// amountCollateral = collateral you'd receive
-// amountDebtToken = equivalent in debt token (TWAP price)
-```
-
-### Mint APE (Go Long) with Collateral Token
-
-The standard flow. Deposit collateral directly; no swap needed. Set `collateralToDepositMin` to `0n` since you're depositing collateral directly.
-
-```typescript
-const erc20Abi = [
-  {
-    type: 'function', name: 'approve', stateMutability: 'nonpayable',
-    inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
-    outputs: [{ name: '', type: 'bool' }],
+// Snapshot config — for production, hydrate addresses/params from
+// https://app.sir.trading/build-data.json so you never drift on redeploys.
+export const CHAINS = {
+  1: {
+    chain: mainnet,
+    rpc: "https://eth.llamarpc.com", // use your own RPC
+    assistant: "0xff14f91285580AEd3733c0B1F3C8b6d04804c5ec",
+    vault: "0x7Dad75dD36dE234C937C105e652B6E50d68b0309",
+    sir: "0x4Da4fb565Dcd5D5C5dB495205c109bA983A8ABa2",
+    wrappedNative: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    sirSymbol: "SIR",
+    hasLock: false,
+    minBidIncrease: 0.01, // auction min bid increment — 1% on Ethereum
   },
-] as const
+  999: {
+    chain: defineChain({ id: 999, name: "HyperEVM",
+      nativeCurrency: { name: "HYPE", symbol: "HYPE", decimals: 18 },
+      rpcUrls: { default: { http: ["https://rpc.hyperliquid.xyz/evm"] } } }),
+    rpc: "https://rpc.hyperliquid.xyz/evm",
+    assistant: "0x7d987b986FbA5e0A4247649A2334Bb2D4029656c",
+    vault: "0x4a35e7448Dad9cAc6B3e529050B5a6Ee56A0eDF0",
+    sir: "0xA06D0c5a8ADb7134903CA13D1FC0641731E2B766",
+    wrappedNative: "0x5555555555555555555555555555555555555555",
+    sirSymbol: "HyperSIR",
+    hasLock: false,
+    minBidIncrease: 0.05, // auction min bid increment — 5%
+  },
+  4326: {
+    chain: defineChain({ id: 4326, name: "MegaETH",
+      nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+      rpcUrls: { default: { http: ["https://mainnet.megaeth.com/rpc"] } } }),
+    rpc: "https://mainnet.megaeth.com/rpc",
+    assistant: "0xB91AE2c8365FD45030abA84a4666C4dB074E53E7",
+    vault: "0x8d694D1b369BdE5B274Ad643fEdD74f836E88543",
+    sir: "0x9367A0c482703d8d9bda995B03f8E71056a72500",
+    wrappedNative: "0x4200000000000000000000000000000000000006",
+    sirSymbol: "MegaSIR",
+    hasLock: true,
+    minBidIncrease: 0.05, // auction min bid increment — 5%
+  },
+} as const;
 
-const collateralToken = '0x...' // the vault's collateral token
-const collateralAmount = parseUnits('100', 18)
-const deadline = BigInt(Math.floor(Date.now() / 1000) + 600) // 10 min
-
-// 1. Approve collateral
-await walletClient.writeContract({
-  address: collateralToken,
-  abi: erc20Abi,
-  functionName: 'approve',
-  args: [VAULT, collateralAmount],
-})
-
-// 2. Mint APE
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [true, vaultParams, collateralAmount, 0n, deadline, 0],
-})
-```
-
-### Mint APE (Go Long) with Debt Token
-
-The vault automatically swaps the debt token to collateral via Kumbaya DEX. When `collateralToDepositMin > 0`, the contract knows `amountToDeposit` is in debt token and performs the swap. Use `quoteMintWithDebtToken` to get the expected collateral output for setting the minimum.
-
-```typescript
-// 1. Quote to get expected collateral after swap
-const [, quotedCollateral] = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'quoteMintWithDebtToken',
-  args: [true, vaultParams, debtAmount],
-})
-const minCollateral = quotedCollateral * 99n / 100n // 1% slippage
-
-// 2. Approve debt token
-await walletClient.writeContract({
-  address: debtToken,
-  abi: erc20Abi,
-  functionName: 'approve',
-  args: [VAULT, debtAmount],
-})
-
-// 3. Mint APE (collateralToDepositMin > 0 signals debt-token deposit)
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [true, vaultParams, debtAmount, minCollateral, deadline, 0],
-})
-```
-
-### Mint APE (Go Long) with Native ETH
-
-If the vault uses WETH as collateral or debt token, send ETH as `msg.value` and the contract wraps it automatically.
-
-```typescript
-// WETH-collateral vault: deposit ETH directly as collateral
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [true, vaultParams, 0n, 0n, deadline, 0],
-  value: parseEther('1'),
-})
-```
-
-### Mint TEA (Provide Liquidity) with Collateral
-
-Same as APE but with `isAPE=false`. The optional `portionLockTime` (0-255) reduces the TEA minting fee: 0 means no lock (full fee), 255 means maximum lock (zero fee). The max lock duration defaults to 90 days.
-
-```typescript
-// Approve collateral first (same as APE flow above)
-
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [false, vaultParams, collateralAmount, 0n, deadline, 128], // ~50% lock for ~50% fee reduction
-})
-```
-
-### Mint TEA (Provide Liquidity) with Debt Token
-
-Same debt-token swap mechanism as APE minting. `collateralToDepositMin > 0` triggers the swap.
-
-```typescript
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [false, vaultParams, debtAmount, minCollateral, deadline, 0],
-})
-```
-
-### Mint TEA (Provide Liquidity) with Native ETH
-
-```typescript
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'mint',
-  args: [false, vaultParams, 0n, 0n, deadline, 0],
-  value: parseEther('1'),
-})
-```
-
-### Burn APE (Close/Reduce Position)
-
-Returns collateral to the caller.
-
-```typescript
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'burn',
-  args: [true, vaultParams, apeAmount, deadline],
-})
-```
-
-### Burn TEA (Withdraw Liquidity)
-
-Returns collateral. TEA must not be locked (check `lockEnd` first).
-
-```typescript
-// Check if TEA is unlocked
-const lockEndTime = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'lockEnd',
-  args: [account.address, vaultId],
-})
-if (lockEndTime > BigInt(Math.floor(Date.now() / 1000))) {
-  throw new Error('TEA is still locked until ' + new Date(Number(lockEndTime) * 1000))
+export function clients(chainId: keyof typeof CHAINS, privateKey?: `0x${string}`) {
+  const c = CHAINS[chainId];
+  const publicClient = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
+  const walletClient = privateKey
+    ? createWalletClient({ account: privateKeyToAccount(privateKey), chain: c.chain, transport: http(c.rpc) })
+    : undefined;
+  return { c, publicClient, walletClient };
 }
 
-await walletClient.writeContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'burn',
-  args: [false, vaultParams, teaAmount, deadline],
-})
+const erc20Abi = [
+  { type: "function", name: "approve", stateMutability: "nonpayable",
+    inputs: [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }],
+    outputs: [{ name: "", type: "bool" }] },
+  { type: "function", name: "allowance", stateMutability: "view",
+    inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "balanceOf", stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+  { type: "function", name: "decimals", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
+] as const;
 ```
 
-### Read Vault Reserves
+> **Defaults to verify:** RPC endpoints above are public examples — supply your own. Always re-read addresses from `build-data.json` in production.
+
+## Default stack decisions
+
+1. **Quote with Assistant, execute with Vault.** Assistant is read-only (`quoteMint`, `quoteBurn`, `getUserBalances`, …). Vault does `mint` / `burn` / `initialize`. SIR does staking, claiming, and auctions.
+2. **SIR is 12 decimals.** `parseUnits(amount, 12)`.
+3. **`VaultParameters` is a struct tuple** `{ debtToken, collateralToken, leverageTier }` — it identifies a vault. The sequential `vaultId` identifies the same vault for APE/TEA/rewards.
+4. **APE address is per-vault** (`Assistant.getAddressAPE(vaultId)` or subgraph `vault.ape.id`). **TEA is the Vault's ERC-1155** with `tokenId == vaultId` and **collateral decimals**.
+
+## Discover pairs (vaults)
+
+### Via subgraph (preferred — one call gives APE addresses, reserves, leverage, volatility)
+
+`vault.id` is the **hex** form of the vault ID (e.g. `"0x13"` = vault 19). Live vaults have `exists: true`.
 
 ```typescript
+const SUBGRAPH = (await fetch("https://app.sir.trading/build-data.json").then(r => r.json()))
+  .chains[String(chainId)].subgraphUrl;
+
+const query = `{
+  vaults(first: 100, orderBy: totalValueUsd, orderDirection: desc) {
+    id exists leverageTier reserveApes reserveLPers totalValueUsd volatilityAnnual
+    collateralToken { id symbol decimals }
+    debtToken { id symbol decimals }
+    ape { id symbol decimals }
+  }
+}`;
+const { vaults } = await fetch(SUBGRAPH, {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }),
+}).then(r => r.json()).then(j => j.data);
+// vaultId (decimal) = parseInt(vault.id, 16)
+// vaultParams = { debtToken: debtToken.id, collateralToken: collateralToken.id, leverageTier }
+```
+
+### Via on-chain enumeration (trustless fallback)
+
+```typescript
+const { c, publicClient } = clients(chainId);
+const n = await publicClient.readContract({ address: c.vault, abi: vaultAbi, functionName: "numberOfVaults" });
+for (let id = 1n; id <= n; id++) {
+  const p = await publicClient.readContract({ address: c.vault, abi: vaultAbi, functionName: "paramsById", args: [id] });
+  // p.debtToken, p.collateralToken, p.leverageTier
+}
+// Batch reserves for many vaults at once:
 const reserves = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'getReserves',
-  args: [vaultParams],
-})
-// reserves.reserveApes — collateral owned by APE holders
-// reserves.reserveLPers — collateral owned by TEA (LP) holders
-// reserves.tickPriceX42 — log_{1.0001}(price) scaled by 2^42
+  address: c.assistant, abi: assistantAbi, functionName: "getReserves",
+  args: [[1, 2, 3]], // uint48[]
+});
 ```
 
-### Read User Positions
-
-Batch-read APE balances, TEA balances, and unclaimed MegaSIR rewards across all vaults.
+## Quote before acting
 
 ```typescript
-const numVaults = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'numberOfVaults',
-})
+const { c, publicClient } = clients(chainId);
+const vaultParams = { debtToken, collateralToken, leverageTier };
 
-// getUserBalances reads vaults [offset+1, offset+numVaults]
-const [apeBalances, teaBalances, unclaimedSirRewards] = await publicClient.readContract({
-  address: ASSISTANT,
-  abi: assistantAbi,
-  functionName: 'getUserBalances',
-  args: [userAddress, 0n, BigInt(numVaults)],
-})
+// Mint with collateral
+const apeOut = await publicClient.readContract({
+  address: c.assistant, abi: assistantAbi, functionName: "quoteMint",
+  args: [true, vaultParams, parseUnits("100", collateralDecimals)] });
 
-// Check individual vault LP rewards
-const pendingRewards = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'unclaimedRewards',
-  args: [vaultId, userAddress],
-})
+// Mint with debt token (includes the DEX swap quote)
+const [tokensOut, collateralAfterSwap, collateralIdeal] = await publicClient.readContract({
+  address: c.assistant, abi: assistantAbi, functionName: "quoteMintWithDebtToken",
+  args: [true, vaultParams, parseUnits("1", debtDecimals)] });
 
-// Check TEA lock status
-const lockEndTimestamp = await publicClient.readContract({
-  address: VAULT,
-  abi: vaultAbi,
-  functionName: 'lockEnd',
-  args: [userAddress, vaultId],
-})
-const isLocked = lockEndTimestamp > BigInt(Math.floor(Date.now() / 1000))
+// Burn (isAPE=false for TEA). amountCollateral & amountDebtToken already net of the burn fee.
+const [collateralOut, debtOut] = await publicClient.readContract({
+  address: c.assistant, abi: assistantAbi, functionName: "quoteBurn",
+  args: [true, vaultParams, apeAmount] });
 ```
 
-### Stake MegaSIR
+## Mint APE (go long)
+
+`mint(isAPE, vaultParams, amountToDeposit, collateralToDepositMin, deadline, portionLockTime)`. The deposit token is inferred: **`collateralToDepositMin == 0` ⇒ depositing collateral; `> 0` ⇒ depositing the debt token, which the Vault swaps to collateral on the chain's DEX** (set the min from a quote for slippage protection). `portionLockTime` is ignored for APE.
 
 ```typescript
-const amount = parseUnits('100', 12) // 12 decimals!
+const { c, publicClient, walletClient } = clients(chainId, pk);
+const deadline = BigInt(nowSecs + 600); // pass `nowSecs` in; or 0n for no deadline
 
-// Stake (uses internal balance accounting, no approve needed)
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'stake',
-  args: [amount],
-})
+// (A) Deposit collateral directly
+await walletClient.writeContract({ address: collateralToken, abi: erc20Abi, functionName: "approve", args: [c.vault, amount] });
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "mint",
+  args: [true, vaultParams, amount, 0n, deadline, 0] });
+
+// (B) Deposit the debt token (Vault swaps debt → collateral)
+const [, quotedCollateral] = await publicClient.readContract({ address: c.assistant, abi: assistantAbi,
+  functionName: "quoteMintWithDebtToken", args: [true, vaultParams, debtAmount] });
+const minCollateral = (quotedCollateral * 99n) / 100n; // 1% slippage
+await walletClient.writeContract({ address: debtToken, abi: erc20Abi, functionName: "approve", args: [c.vault, debtAmount] });
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "mint",
+  args: [true, vaultParams, debtAmount, minCollateral, deadline, 0] });
+
+// (C) Native gas token as collateral (vault collateral is the wrapped native, e.g. WETH/WHYPE)
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "mint",
+  args: [true, vaultParams, 0n, 0n, deadline, 0], value: parseUnits("1", 18) });
 ```
 
-### Check Stake Status
+> **Native-deposit guard:** when sending native value **and** the native maps to the vault's *debt* token (so a swap is required), `collateralToDepositMin` **must be `> 0`** — otherwise the contract checks `collateralToken == WETH` instead of `debtToken == WETH` and reverts `NotAWETHVault`. When the native is the *collateral*, `min = 0n` is correct.
 
-Locked stake unlocks progressively with a 30-day half-life: after 30 days half is unlocked, after 60 days 75%, etc. Only the unlocked portion can be unstaked.
+## Mint TEA (provide liquidity)
+
+Same call with `isAPE=false`. **`portionLockTime` only matters where the chain has a lock period (`lpLockTime > 0` — MegaETH today).** There, `0` = full fee / no lock, `255` = zero fee / maximum lock (90 days), and intermediate values trade fee for lock time. On Ethereum and HyperEVM there is no lock: pass `0`, the fee is fixed, and TEA is withdrawable immediately.
 
 ```typescript
-const [unlockedStake, lockedStake] = await publicClient.readContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'stakeOf',
-  args: [account.address],
-})
-// unlockedStake — can be unstaked now
-// lockedStake — still locked, unlocking with 30-day half-life
+// Collateral deposit; ~half lock for ~half fee reduction on MegaETH (portionLockTime=128)
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "mint",
+  args: [false, vaultParams, amount, 0n, deadline, c.hasLock ? 128 : 0] });
+
+// Debt-token and native variants mirror the APE flows above with isAPE=false.
 ```
 
-### Unstake MegaSIR
+## Burn (close / withdraw)
 
-Can only unstake up to the unlocked portion. Reverts if amount exceeds unlocked stake.
+Returns collateral to the caller. For TEA on a lock chain, check `lockEnd` first.
 
 ```typescript
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'unstake',
-  args: [amount], // must be <= unlockedStake
-})
-```
+// Burn APE
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "burn",
+  args: [true, vaultParams, apeAmount, deadline] });
 
-### Claim Staking Dividends
-
-Claims accrued ETH dividends without unstaking.
-
-```typescript
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'claim',
-})
-```
-
-### Unstake and Claim in One Transaction
-
-```typescript
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'unstakeAndClaim',
-  args: [amount],
-})
-```
-
-### Claim LP Rewards
-
-```typescript
-// Claim MegaSIR rewards for providing TEA liquidity in a vault
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'lperMint',
-  args: [vaultId],
-})
-
-// Or claim and stake in one tx
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'lperMintAndStake',
-  args: [vaultId],
-})
-```
-
-### Start a Fee Auction
-
-Anyone can call this to initiate an auction for accumulated fees in a given token. Auctions last 24 hours, with a 247-hour cooldown between auctions for the same token.
-
-```typescript
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'collectFeesAndStartAuction',
-  args: [tokenAddress],
-})
-```
-
-### Bid on an Auction
-
-Must exceed the previous bid by at least 5% on MegaETH. Send ETH as `msg.value`.
-
-```typescript
-// Check current auction state
-const [bidder, currentBid, startTime] = await publicClient.readContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'auctions',
-  args: [tokenAddress],
-})
-
-// Place a bid (must be >= previous bid * 1.05)
-const bidAmount = currentBid * 105n / 100n + 1n // 5% above previous
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'bid',
-  args: [tokenAddress, bidAmount],
-  value: bidAmount,
-})
-```
-
-### Claim Auction Lot
-
-Winner calls after the 24-hour auction ends to receive the auctioned tokens.
-
-```typescript
-await walletClient.writeContract({
-  address: SIR,
-  abi: sirAbi,
-  functionName: 'getAuctionLot',
-  args: [tokenAddress, beneficiaryAddress],
-})
-```
-
-## Foundry Integration (Solidity)
-
-### Mint APE (Go Long) from Collateral
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
-
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
-
-interface IVault {
-    struct VaultParameters {
-        address debtToken;
-        address collateralToken;
-        int8 leverageTier;
-    }
-
-    function mint(
-        bool isAPE,
-        VaultParameters calldata vaultParams,
-        uint256 amountToDeposit,
-        uint144 collateralToDepositMin,
-        uint40 deadline,
-        uint8 portionLockTime
-    ) external payable returns (uint256);
+// Burn TEA — on MegaETH, ensure it's unlocked
+if (c.hasLock) {
+  const lockEnd = await publicClient.readContract({ address: c.vault, abi: vaultAbi,
+    functionName: "lockEnd", args: [account, vaultId] });
+  if (lockEnd > BigInt(nowSecs)) throw new Error(`TEA locked until ${new Date(Number(lockEnd) * 1000)}`);
 }
-
-contract SirMinter {
-    IVault constant VAULT = IVault(0x8d694D1b369BdE5B274Ad643fEdD74f836E88543);
-
-    function mintAPE(
-        IVault.VaultParameters calldata vaultParams,
-        uint256 collateralAmount
-    ) external returns (uint256 apeAmount) {
-        IERC20(vaultParams.collateralToken).transferFrom(msg.sender, address(this), collateralAmount);
-        IERC20(vaultParams.collateralToken).approve(address(VAULT), collateralAmount);
-
-        apeAmount = VAULT.mint(
-            true,                           // isAPE
-            vaultParams,
-            collateralAmount,
-            0,                              // collateralToDepositMin (0 = collateral deposit)
-            uint40(block.timestamp + 600),  // deadline
-            0                               // portionLockTime (ignored for APE)
-        );
-    }
-}
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "burn",
+  args: [false, vaultParams, teaAmount, deadline] });
 ```
 
-### Read Reserves and Quote Burn via Assistant
+## Create a new pair (initialize a vault)
 
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+Requires a DEX pool to exist for the collateral/debt pair. `getVaultStatus`: `0`=Invalid, `1`=NoPool, `2`=CanBeCreated, `3`=AlreadyExists.
 
-interface IAssistant {
-    struct VaultParameters {
-        address debtToken;
-        address collateralToken;
-        int8 leverageTier;
-    }
-
-    struct Reserves {
-        uint144 reserveApes;
-        uint144 reserveLPers;
-        int64 tickPriceX42;
-    }
-
-    function getReserves(uint48[] calldata vaultIds) external view returns (Reserves[] memory);
-    function quoteBurn(bool isAPE, VaultParameters calldata vaultParams, uint256 amountTokens)
-        external view returns (uint144 amountCollateral, uint256 amountDebtToken);
-}
-
-contract SirReader {
-    IAssistant constant ASSISTANT = IAssistant(0xB91AE2c8365FD45030abA84a4666C4dB074E53E7);
-
-    function getReservesAndQuoteBurn(
-        uint48 vaultId,
-        IAssistant.VaultParameters calldata vaultParams,
-        uint256 apeAmount
-    ) external view returns (
-        IAssistant.Reserves memory reserves,
-        uint144 collateralOut,
-        uint256 debtTokenOut
-    ) {
-        uint48[] memory ids = new uint48[](1);
-        ids[0] = vaultId;
-        reserves = ASSISTANT.getReserves(ids)[0];
-        (collateralOut, debtTokenOut) = ASSISTANT.quoteBurn(true, vaultParams, apeAmount);
-    }
-}
+```typescript
+const status = await publicClient.readContract({ address: c.assistant, abi: assistantAbi,
+  functionName: "getVaultStatus", args: [vaultParams] });
+if (status !== 2) throw new Error(`Cannot create (status ${status})`);
+await walletClient.writeContract({ address: c.vault, abi: vaultAbi, functionName: "initialize", args: [vaultParams] });
 ```
 
-## Fee Structure Reference
+> **Pick the leverage tier for the pair's volatility.** `maxTier = floor(-log2(volatility) - 1)` (volatility = annualized, from the subgraph's `volatilityAnnual` or a 30-day EWMA). Too high a tier for the pair's volatility makes the vault saturate frequently — bad for both traders and LPs.
 
-| Fee | Rate | Recipient |
-|-----|------|-----------|
-| APE mint/burn | Same fee applies independently on both mint and burn: `feeRate = (baseFee × 2^tier) / (10000 + baseFee × 2^tier)` with default `baseFee = 1000`. Per-operation examples: tier -2 (1.0625x) ~2.4%, tier 0 (2x) ~9.1%, tier 1 (3x) ~16.7%, tier 2 (5x) ~28.6%. `priceOfAPE` and `quoteBurn` already account for the burn fee. | LPers + Stakers (stakers get up to 50% depending on vault tax) |
-| TEA mint | Default ~4.9% (`lpFee` 515 bps). **Reducible to 0% with full lock** (max lock defaults to 90 days) | Protocol-Owned Liquidity |
+## Read user positions
+
+```typescript
+// Batch APE + TEA + unclaimed SIR across vaults [offset+1 .. offset+numVaults]
+const n = await publicClient.readContract({ address: c.vault, abi: vaultAbi, functionName: "numberOfVaults" });
+const [apeBalances, teaBalances, unclaimedSir] = await publicClient.readContract({
+  address: c.assistant, abi: assistantAbi, functionName: "getUserBalances",
+  args: [user, 0n, BigInt(n)] });
+```
+
+Or via subgraph (`apePositions` / `teaPositions` by `user`) for cost basis (`collateralTotal`, `dollarTotal`, `debtTokenTotal`) and `lockEnd`.
+
+## Stake / unstake / claim SIR
+
+Staking moves your own SIR balance into staked state inside the SIR contract — **no `approve` needed.** Locked stake unlocks on a 30-day half-life (50% at 30d, 75% at 60d, …); only the unlocked portion can be unstaked. `claim` pays accrued dividends in the **chain's native token** (ETH / HYPE).
+
+```typescript
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "stake", args: [parseUnits("100", 12)] });
+
+const [unlocked, locked] = await publicClient.readContract({ address: c.sir, abi: sirAbi, functionName: "stakeOf", args: [account] });
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "unstake", args: [unlocked] }); // <= unlocked
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "claim" });                       // native dividends
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "unstakeAndClaim", args: [unlocked] });
+```
+
+## Claim rewards (LP + contributor)
+
+LP and contributor rewards are minted as SIR. `*AndStake` mints and stakes in one tx.
+
+```typescript
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "lperMint", args: [vaultId] });
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "lperMintAndStake", args: [vaultId] });
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "contributorMint" });
+```
+
+## Fee auctions
+
+Protocol fees accumulate per token and are auctioned for the chain's dividend token (WETH / WHYPE / WETH). Bids are placed in the **native** token (ETH / HYPE); the winning bid becomes staker dividends and the winner collects the fee lot.
+
+- **`bid` is `payable` on every chain.** Send native value as `msg.value` and the contract wraps it to the chain's WETH/WHYPE automatically; **or** send `msg.value: 0` after approving WETH/WHYPE to the SIR contract and it pulls `amount` via `transferFrom`.
+- A new bid must beat the current one by the chain's **minimum increment — 1% on Ethereum, 5% on HyperEVM and MegaETH** — strictly (a bid exactly at the increment is rejected; e.g. on a 5% chain `100*amount > 105*currentBid`). If you are already the top bidder, an additional bid **adds** to your standing bid.
+- Auctions last `AUCTION_DURATION` = **24h**, with `AUCTION_COOLDOWN` = **247h (~10.3 days)** before the same token can be auctioned again.
+
+```typescript
+const auction = await publicClient.readContract({ address: c.sir, abi: sirAbi, functionName: "auctions", args: [token] });
+// Min increment is per-chain: 1% (Ethereum) or 5% (HyperEVM, MegaETH)
+const incBps = 100n + BigInt(Math.round(c.minBidIncrease * 100)); // 101n or 105n
+const bidAmount = (auction.bid * incBps) / 100n + 1n;
+
+// Native bid (auto-wrapped)
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "bid", args: [token, bidAmount], value: bidAmount });
+
+// Start an auction for a token's accrued fees
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "collectFeesAndStartAuction", args: [token] });
+
+// Winner collects the lot after the auction ends
+await walletClient.writeContract({ address: c.sir, abi: sirAbi, functionName: "getAuctionLot", args: [token, beneficiary] });
+```
+
+## Fee structure
+
+System parameters are read live (`build-data.json` / SystemControl); current defaults are `baseFee = 0.1` and `lpFee = 0.0515` (the decimal forms; on-chain integers are 1000 and 515).
+
+**APE (leverage) fee.** A fee is charged on **both** mint and burn, and the protocol's headline fee is the combined round trip. Each side multiplies the collateral by `1/(1+(ℓ−1)·baseFee)`, where `ℓ = 1 + 2^leverageTier`:
+
+- **round-trip fee (the quoted fee — mint *and* burn) = `1 − 1/(1+(ℓ−1)·baseFee)²`**
+- per-side fee (a single mint or single burn, what `quoteMint`/`quoteBurn` reflect) = `1 − 1/(1+(ℓ−1)·baseFee)`
+
+With `baseFee = 0.1`:
+
+| Leverage | tier | per side | round trip |
+|---|:---:|:---:|:---:|
+| 1.25× | −2 | 2.4% | 4.8% |
+| 1.5× | −1 | 4.8% | 9.3% |
+| 2× | 0 | 9.1% | 17% |
+| 3× | 1 | 16.7% | 31% |
+| 5× | 2 | 28.6% | 49% |
+
+`quoteMint` / `quoteBurn` / `priceOfAPE` already net the relevant side, so you rarely compute this yourself. Recipients: LPers + stakers (staker share set by `cumulativeTax`).
+
+**Other fees:**
+
+| Fee | Value | Recipient |
+|---|---|---|
+| TEA mint | `1 − 1/(1+lpFee)`, `lpFee=0.0515` ⇒ **~4.9%**. Reducible toward 0 with `portionLockTime` where `lpLockTime>0` (**MegaETH only**). | Protocol-owned liquidity |
 | TEA burn | 0% | — |
-| Staker dividends | Distributed via fee auctions (24h duration, 247h cooldown) | MegaSIR stakers (in ETH) |
+| Staker dividends | Distributed via fee auctions; **at most 50% of vault fees** go to stakers (the rest to LPs; split set by `cumulativeTax`). | SIR stakers, in the chain's **native token** |
 
-## MegaETH-Specific Notes
+## Per-chain notes
 
-- **Instant receipts:** Use `eth_sendRawTransactionSync` for sub-10ms confirmation via EIP-7966.
-- **No public mempool:** Transactions are sequencer-ordered. Front-running risk is structurally lower.
-- **Gas model:** SSTORE costs differ from L1. First vault interactions are more expensive (new storage slots).
-- **MegaSIR has 12 decimals**, not 18. Always use `parseUnits(amount, 12)`.
-- **APE tokens have dynamic per-vault naming:** each vault deploys a separate APE clone. There is no single "MegaAPE" token.
-- **Optional TEA lock for fee reduction:** `portionLockTime` 0-255, where 0 = no lock (full fee), 255 = max lock (zero fee).
-- **Oracle:** 30-minute TWAP from Kumbaya DEX pools.
-- **Auction minimum bid increase:** 5%.
-- **Manipulation resistance:** Fees on both mint and burn plus a long 30-minute TWAP minimize price manipulation attacks.
-- **Saturation risk:** When creating vaults, if leverage is too high for the pair's volatility, the vault will frequently enter saturation, making it unappealing for both traders and LPs.
+- **Ethereum (1):** Uniswap v3 oracle/swaps (30-min TWAP, 5-min update cadence). No TEA lock (`portionLockTime` is a no-op; pass `0`). Native ETH, SIR symbol `SIR`. **Auction min bid increment: 1%.** Standard L1 gas/mempool.
+- **HyperEVM (999):** HyperSwap oracle/swaps (30-min TWAP, 1-min update cadence). No TEA lock. **Native token is HYPE; wrapped native is WHYPE `0x5555…5555`** — native deposits and staker dividends are in HYPE. SIR symbol `HyperSIR`. **Auction min bid increment: 5%.** Public RPC `https://rpc.hyperliquid.xyz/evm`.
+- **MegaETH (4326):** Kumbaya oracle/swaps (30-min TWAP, 1-min update cadence). **TEA minting can optionally lock the position for up to 90 days to reduce the mint fee** — `portionLockTime` trades lock time for a lower fee (`0` = no lock / full fee → `255` = max 90-day lock / ~0 fee). It is never mandatory. While locked, `burn` reverts `TEALocked` (`lockEnd` in the future) and TEA transfers revert `TransferToLowerLockEnd` if the sender's lock end exceeds the recipient's. Native ETH, SIR symbol `MegaSIR`. **Auction min bid increment: 5%.** MegaETH-specific extras: `eth_sendRawTransactionSync` (EIP-7966) for sub-10ms receipts; sequencer-ordered txs (no public mempool); first-touch storage writes cost more.
+
+## Safety notes for agents
+
+- **Check `mintingStopped`** (per chain, in `build-data.json`/SystemControl) before minting — if `true`, mints revert.
+- **Protocol state (beta).** Beyond `mintingStopped`, the protocol can enter an **Emergency** state that suspends new deposits while still allowing withdrawals. Treat a mint revert as possibly state-driven, and keep burn/withdraw paths available even when minting is off.
+- **SIR is per-chain.** Each chain issues its own SIR (~2.015B/yr) with no cross-chain bridge — balances, staking, and rewards never move between chains. A portfolio tracker must read each chain separately.
+- **No UI guardrails.** Direct contract calls bypass the app's vault blocklist (pairs the UI disables for thin liquidity). Before minting, sanity-check the vault's reserves and saturation via `getReserves` / subgraph; a saturated or illiquid vault is a bad entry.
+- **Always quote and set slippage/min-out** for debt-token deposits (`collateralToDepositMin`) — these route through the DEX.
+- **Set a real `deadline`** (unix seconds) on `mint`/`burn`; `0` disables the check.
+- **Amount parsing:** use `parseUnits`/`formatUnits` with the correct decimals (SIR=12, APE=`ape.decimals`, TEA=collateral decimals). Never round-trip token amounts through JS `Number`.
 
 ## Resources
 
-- [Sir Trading App](https://app.sir.trading): Web interface
-- [Sir Trading Docs](https://docs.sir.trading): Protocol documentation
-- [Core Contracts](https://github.com/SIR-trading/Core): Vault, SIR/Staker, TEA, APE, Oracle
-- [Periphery Contracts](https://github.com/SIR-trading/Periphery): Assistant, Quoter, Treasury
-- Kumbaya DEX skill: for swap integration and pool discovery
+- App: https://app.sir.trading · Live data: https://app.sir.trading/build-data.json
+- Docs: https://docs.sir.trading
+- Core contracts (Vault, SIR/Staker, TEA, APE, Oracle): https://github.com/SIR-trading/Core
+- Periphery (Assistant, Quoter, Treasury): https://github.com/SIR-trading/Periphery
+- This skill: https://github.com/SIR-trading/sir-trading-skill
