@@ -8,7 +8,7 @@ AI coding skill for [SIR Trading](https://app.sir.trading), a no-liquidation lev
 
 - **APE/TEA minting & burning** — all three deposit methods (collateral, debt token, native gas token)
 - **Quoting** — expected output before minting/burning
-- **Vault discovery & creation** — subgraph and on-chain enumeration, status checks, initialize
+- **Vault discovery & creation** — on-chain enumeration and the app's vault API, status checks, initialize
 - **SIR staking** — stake, unstake, claim native dividends (12 decimals!)
 - **Reward claiming** — LP and contributor rewards (minted as SIR)
 - **Fee auctions** — start, bid (native or wrapped), claim lots
@@ -17,8 +17,8 @@ AI coding skill for [SIR Trading](https://app.sir.trading), a no-liquidation lev
 
 The skill points at two always-fresh data sources so addresses and parameters never go stale:
 
-- **`https://app.sir.trading/build-data.json`** — per-chain contract addresses + live system parameters + subgraph URL
-- **The per-chain subgraph** — indexed vaults, positions, auctions, and metrics
+- **`https://app.sir.trading/build-data.json`** — per-chain contract addresses + live system parameters
+- **`https://app.sir.trading/api/vaults`** — indexed vaults, reserves, and metrics
 
 ## Usage
 
